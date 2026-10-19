@@ -683,9 +683,12 @@ impl<'a> PdfDocument<'a> {
     /// What is counted is the decoded bytes of the page's content streams,
     /// joined, then of every form, pattern cell, soft-mask group, Type 3
     /// glyph procedure and annotation appearance the page runs, each time
-    /// it runs: a form drawn ten times counts ten times. A stream is
-    /// decoded no further than what is left, so the limit bounds the
-    /// memory decoding takes as well as the time interpreting does.
+    /// it runs: a form drawn ten times counts ten times. Every one of
+    /// them but a glyph procedure is decoded no further than what is
+    /// left, so the limit bounds the memory decoding takes as well as the
+    /// time interpreting does. A Type 3 font's glyph procedures are
+    /// decoded in full when the font is loaded, held only to the limit
+    /// every stream is, and count toward this one each time they run.
     ///
     /// A page that passes it is not drawn: [`render_page`](Self::render_page)
     /// returns [`PdfError::ContentLimit`] with

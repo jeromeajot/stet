@@ -215,8 +215,11 @@ doc.set_max_content_bytes(Some(64 << 20)); // decoded bytes per page
 What is counted is the decoded bytes of the page's content streams,
 joined, and of every form, pattern cell, soft-mask group, Type 3 glyph
 procedure and annotation appearance the page runs, each time it runs: a
-form drawn ten times counts ten times. A stream is decoded no further
-than what is left of the limit. `None`, the default, lifts it.
+form drawn ten times counts ten times. Every one of them but a glyph
+procedure is decoded no further than what is left of the limit. A Type 3
+font's glyph procedures are decoded in full when the font is loaded,
+held only to the limit every stream is, and count toward this one each
+time they run. `None`, the default, lifts it.
 
 A page over either limit is not drawn, rather than drawn in part.
 `render_page` returns `PdfError::ContentLimit`, whose `ContentLimit`
