@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   32000-1 gives 28 as a typical limit. New too is
   `PdfDocument::set_max_content_bytes`, a ceiling on the decoded bytes
   of content one page interprets, counting a form each time it is
-  drawn, and decoding no stream further than what is left of it. Off by
-  default, since a heavy page of vector art reaches a hundred megabytes.
+  drawn, and decoding no stream but a glyph procedure further than what
+  is left of it. Off by default, since a heavy page of vector art reaches
+  a hundred megabytes.
   A page over either limit is not drawn: `render_page` returns the new
   `PdfError::ContentLimit`, carrying a `ContentLimit` that names the
   limit, and adds no parse warning for it, so a caller tells it apart
