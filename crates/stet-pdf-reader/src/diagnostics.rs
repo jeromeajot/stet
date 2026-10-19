@@ -66,8 +66,56 @@ pub enum ParsePhase {
     Content,
     /// The page tree, read when the document is opened: a branch nested
     /// too deeply to follow, or a node listed under two parents. The pages
-    /// below such a node are not in the document's page list.
+    /// below such a node are not in the document's page list. Also a page
+    /// the tree names that cannot be read, which is left out, and a page
+    /// list found by scanning the file for page objects because the tree
+    /// could not be followed, which may hold pages from an earlier
+    /// revision or miss some.
     PageTree,
+    /// The cross-reference table, read when the document is opened. A
+    /// table rebuilt by scanning the file for objects, because the one the
+    /// file gives is missing or damaged, is reported at
+    /// [`Severity::Info`]: the objects were found where they are. What
+    /// could not be found is reported where it is missed, a page in
+    /// [`PageTree`](Self::PageTree) and page content in
+    /// [`Content`](Self::Content).
+    CrossReference,
+    /// An image left out of a page because it has more samples than
+    /// [`set_max_image_pixels`](crate::PdfDocument::set_max_image_pixels)
+    /// allows. The page is in the warning's
+    /// [`location`](ParseWarning::location); `width` and `height` are the
+    /// image's size as the file stores it, which for a JPEG 2000 image
+    /// may be larger than the size it would have been decoded at.
+    ///
+    /// Recorded as pages are rendered, once for each page and size: an
+    /// image used on two pages is reported for each of them.
+    ImageLeftOut {
+        width: u32,
+        height: u32,
+    },
+    /// A font the document uses without embedding its program, that is
+    /// not one of the standard 14 fonts the reader carries. A substitute is
+    /// drawn in its place, so its text is still read, but its glyphs may
+    /// not look as they should. The page is in the warning's
+    /// [`location`](ParseWarning::location); the message does not name the
+    /// font.
+    ///
+    /// An embedded font program that cannot be read is a
+    /// [`Content`](Self::Content) warning instead.
+    MissingFont,
+    /// A predefined CMap a composite font names for its encoding that is
+    /// neither embedded nor found among the CMap files the reader looks
+    /// in. Without it the font's character codes cannot be told apart, so
+    /// the text in that font is left out: nothing is drawn for it and no
+    /// text is extracted from it. `Identity-H` and `Identity-V` need no
+    /// file and are never reported. The page is in the warning's
+    /// [`location`](ParseWarning::location); the message does not name the
+    /// CMap.
+    ///
+    /// An embedded CMap that names another with `usecmap` that cannot be
+    /// found is reported the same way, though the codes it maps itself
+    /// are still read.
+    MissingCMap,
 }
 
 /// Where in the document a problem occurred.

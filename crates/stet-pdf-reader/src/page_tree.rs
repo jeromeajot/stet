@@ -209,6 +209,13 @@ fn collect_pages_via_catalog_scan(
             .is_ok()
                 && !found.pages.is_empty()
             {
+                resolver.warnings().record_once(
+                    ParsePhase::PageTree,
+                    None,
+                    Severity::Warning,
+                    "the catalog has no page tree; the pages are those of a catalog \
+                     found by scanning the file, which may be from an earlier revision",
+                );
                 return Ok((found.pages, found.notes));
             }
         }
@@ -256,6 +263,13 @@ fn collect_pages_by_scan(resolver: &Resolver) -> Result<(Vec<PageInfo>, PageBoxN
         return Err(PdfError::MissingKey("Pages"));
     }
 
+    resolver.warnings().record_once(
+        ParsePhase::PageTree,
+        None,
+        Severity::Warning,
+        "the page tree cannot be followed; the pages are those found by scanning \
+         the file, which may miss some or include pages from an earlier revision",
+    );
     Ok((pages, notes))
 }
 
@@ -408,8 +422,8 @@ fn collect_pages_recursive(
         for kid in kids {
             match kid {
                 PdfObj::Ref(n, g) => {
-                    let child = resolver.resolve(*n, *g)?;
-                    if let Some(child_dict) = child.as_dict() {
+                    let child = resolver.resolve(*n, *g);
+                    if let Some(child_dict) = child.as_ref().ok().and_then(PdfObj::as_dict) {
                         collect_pages_recursive(
                             resolver,
                             child_dict,
@@ -419,6 +433,20 @@ fn collect_pages_recursive(
                             visited,
                             depth + 1,
                         )?;
+                    } else {
+                        // Missing, unreadable, or not a dictionary: there
+                        // is no page here to read, and the pages after it
+                        // are still the document's.
+                        resolver.warnings().record_once(
+                            ParsePhase::PageTree,
+                            Some(LocationHint::Object {
+                                obj_num: *n,
+                                gen_num: *g,
+                            }),
+                            Severity::Warning,
+                            "a page or branch the page tree names cannot be read; \
+                             it is left out",
+                        );
                     }
                 }
                 _ => {

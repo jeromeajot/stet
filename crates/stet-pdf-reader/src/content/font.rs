@@ -134,6 +134,10 @@ pub struct CidTrueTypePdfFont {
     /// The font's hinting state, set up the first time an outline is asked
     /// for: see [`TrueTypeHinting`].
     hinting: TrueTypeHinting,
+    /// The font's CMap was not found, so how its codes divide is not
+    /// known: nothing is drawn or read in it. See
+    /// [`ParsePhase::MissingCMap`](crate::diagnostics::ParsePhase::MissingCMap).
+    pub(crate) codes_unknown: bool,
 }
 
 /// CIDFontType0: CFF outlines accessed by CID (2-byte char codes).
@@ -207,8 +211,8 @@ pub(crate) struct DocumentFonts {
     clock: u64,
 }
 
-/// The content warnings resolving a font raised.
-pub(crate) type FontWarnings = Vec<(crate::diagnostics::Severity, String)>;
+/// The page warnings resolving a font raised.
+pub(crate) type FontWarnings = Vec<crate::resolver::PageWarning>;
 
 struct KeptFont {
     font: Arc<PdfFont>,
@@ -445,7 +449,8 @@ pub fn resolve_font(
                 },
             ) {
                 Ok(font) => return Ok(font),
-                Err(_) => {
+                Err(e) => {
+                    report_unreadable_font(resolver, &e);
                     if let Some(font) = substitute_font(
                         &base_font_name,
                         encoding.clone(),
@@ -465,7 +470,8 @@ pub fn resolve_font(
             // Try embedded TrueType (falls back to CFF internally if data is OTTO/CFF)
             match resolve_truetype(resolver, &descriptor, encoding.clone(), widths, font_dict) {
                 Ok(font) => return Ok(font),
-                Err(_) => {
+                Err(e) => {
+                    report_unreadable_font(resolver, &e);
                     if let Some(font) = substitute_font(
                         &base_font_name,
                         encoding.clone(),
@@ -495,7 +501,8 @@ pub fn resolve_font(
                 },
             ) {
                 Ok(font) => return Ok(font),
-                Err(_) => {
+                Err(e) => {
+                    report_unreadable_font(resolver, &e);
                     if let Some(font) = substitute_font(
                         &base_font_name,
                         encoding.clone(),
@@ -513,6 +520,14 @@ pub fn resolve_font(
         }
     }
     // No embedded font program — try font substitution
+    let embedded = descriptor.as_ref().is_some_and(|d| {
+        d.get(b"FontFile").is_some()
+            || d.get(b"FontFile2").is_some()
+            || d.get(b"FontFile3").is_some()
+    });
+    if !embedded && !is_standard_14_alias(without_subset_prefix(&base_font_name)) {
+        report_font_not_embedded(resolver);
+    }
     if let Some(font) = substitute_font(
         &base_font_name,
         encoding.clone(),
@@ -578,6 +593,35 @@ pub fn resolve_font(
                 no_base_encoding,
             },
         ),
+    }
+}
+
+/// Say that the page uses a font the document does not embed and the
+/// reader does not carry, so a substitute is drawn: see
+/// [`ParsePhase::MissingFont`](crate::diagnostics::ParsePhase::MissingFont).
+fn report_font_not_embedded(resolver: &Resolver) {
+    resolver.warn_page(
+        crate::diagnostics::ParsePhase::MissingFont,
+        crate::diagnostics::Severity::Warning,
+        "a font is not embedded in the document; a substitute is drawn in its place",
+    );
+}
+
+/// Say that a font program the document embeds could not be read, so a
+/// substitute is drawn in its place.
+fn report_unreadable_font(resolver: &Resolver, error: &PdfError) {
+    resolver.warn_content(
+        crate::diagnostics::Severity::Warning,
+        format!("embedded font program could not be read ({error}); a substitute is drawn"),
+    );
+}
+
+/// A font name without the six-letter tag a subset is named with
+/// (`ABCDEF+Times-Roman` is `Times-Roman`).
+fn without_subset_prefix(name: &str) -> &str {
+    match name.as_bytes().get(6) {
+        Some(b'+') if name.len() > 7 => &name[7..],
+        _ => name,
     }
 }
 
@@ -2878,6 +2922,41 @@ fn build_cff_font(
     }))
 }
 
+/// Say that the page uses a composite font whose CMap is neither embedded
+/// nor found: see
+/// [`ParsePhase::MissingCMap`](crate::diagnostics::ParsePhase::MissingCMap).
+fn report_cmap_not_found(resolver: &Resolver) {
+    resolver.warn_page(
+        crate::diagnostics::ParsePhase::MissingCMap,
+        crate::diagnostics::Severity::Warning,
+        "a CMap is neither embedded in the document nor found; \
+         the text in the font that uses it is left out",
+    );
+}
+
+/// Whether the descendant of a Type 0 font embeds its font program. Taken
+/// to be so when the font cannot be followed as far as its descriptor,
+/// since that is a fault of its own rather than a font left out.
+fn type0_font_is_embedded(resolver: &Resolver, font_dict: &PdfDict) -> bool {
+    let descendant = font_dict
+        .get(b"DescendantFonts")
+        .and_then(|obj| resolver.deref(obj).ok())
+        .and_then(|obj| obj.as_array()?.first().cloned())
+        .and_then(|obj| resolver.deref(&obj).ok());
+    let Some(descendant) = descendant.as_ref().and_then(PdfObj::as_dict) else {
+        return true;
+    };
+    match get_font_descriptor(descendant, resolver) {
+        Ok(Some(desc)) => {
+            desc.get(b"FontFile").is_some()
+                || desc.get(b"FontFile2").is_some()
+                || desc.get(b"FontFile3").is_some()
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// Resolve a Type 0 composite font (CIDFontType2 descendant with TrueType outlines).
 fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, PdfError> {
     // Check if encoding is UCS2-based (character codes are Unicode, not CIDs).
@@ -2891,13 +2970,26 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
     //   - a stream containing a custom CMap
     //   - a name like "Identity-H" (identity mapping, 2-byte codes)
     //   - a predefined CMap name like "GBK-EUC-H" (load from system)
+    let mut cmap_missing = false;
     let (code_lengths, code_to_cid, mut wmode) = if let Some(enc_obj) = encoding_obj {
         if let Ok(cmap_data) = resolver.stream_data_from_obj(enc_obj) {
-            // Embedded CMap stream
+            // Embedded CMap stream. One it builds on with `usecmap` must be
+            // found as a predefined CMap is; the codes it maps itself are
+            // read either way.
+            let base_missing = std::cell::Cell::new(false);
             let cmap = super::cmap::CMap::parse_with_loader(
                 &cmap_data,
-                Some(&|name| load_predefined_cmap(name)),
+                Some(&|name| {
+                    let found = load_predefined_cmap(name);
+                    if found.is_none() && !name.starts_with(b"Identity") {
+                        base_missing.set(true);
+                    }
+                    found
+                }),
             );
+            if base_missing.get() {
+                report_cmap_not_found(resolver);
+            }
             (cmap.code_lengths, cmap.code_to_cid, cmap.wmode)
         } else if !encoding_name.is_empty() && !encoding_name.starts_with(b"Identity") {
             // Predefined CMap name (e.g. GBK-EUC-H) — load from system
@@ -2908,17 +3000,23 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
                 );
                 (cmap.code_lengths, cmap.code_to_cid, cmap.wmode)
             } else {
-                resolver.warn_content(
-                    crate::diagnostics::Severity::Warning,
-                    format!(
-                        "predefined CMap '{}' not found; \
-                         set STET_CMAP_DIR or install poppler-data for CJK support",
-                        String::from_utf8_lossy(encoding_name)
-                    ),
-                );
+                report_cmap_not_found(resolver);
+                // A UCS-2 CMap's codes are Unicode, two bytes each, which
+                // the Latin fallback below relies on. Any other CMap says
+                // how its codes divide, and without it they cannot be
+                // read at all.
+                cmap_missing = !ucs2_encoding;
                 ([2u8; 256], HashMap::new(), 0)
             }
         } else {
+            if encoding_name.is_empty() {
+                // Not a name, so a CMap the document embeds, and it could
+                // not be read.
+                resolver.warn_content(
+                    crate::diagnostics::Severity::Warning,
+                    "embedded CMap could not be read; codes are read two bytes at a time",
+                );
+            }
             ([2u8; 256], HashMap::new(), 0) // Identity-H/V or fallback
         }
     } else {
@@ -2929,6 +3027,33 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
         wmode = 1;
     } else if encoding_name.ends_with(b"-H") {
         wmode = 0;
+    }
+    if cmap_missing {
+        // Nothing is drawn or read in this font, so its program is not
+        // needed; whether the document carries it is still worth saying.
+        if !type0_font_is_embedded(resolver, font_dict) {
+            report_font_not_embedded(resolver);
+        }
+        return Ok(PdfFont::CidTrueType(CidTrueTypePdfFont {
+            data: Vec::new(),
+            default_width: 0.0,
+            cid_widths: HashMap::new(),
+            cmap: HashMap::new(),
+            units_per_em: 1000.0,
+            identity_cid_to_gid: false,
+            substituted: true,
+            cid_to_gid_map: None,
+            to_unicode: HashMap::new(),
+            ordering: Vec::new(),
+            ucs2_encoding,
+            code_lengths,
+            code_to_cid,
+            wmode,
+            dw2: [880.0, -1000.0],
+            w2: HashMap::new(),
+            hinting: TrueTypeHinting::default(),
+            codes_unknown: true,
+        }));
     }
 
     // Get DescendantFonts array (must have exactly one entry).
@@ -3144,6 +3269,7 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
                 font_data
             } else {
                 // Font not embedded — try system font lookup
+                report_font_not_embedded(resolver);
                 substituted = true;
                 let base_font = cid_font_dict
                     .get_name(b"BaseFont")
@@ -3303,6 +3429,7 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
                 dw2,
                 w2: w2.clone(),
                 hinting: TrueTypeHinting::default(),
+                codes_unknown: false,
             }))
         }
         b"CIDFontType0" => {
@@ -3342,6 +3469,7 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
                         dw2,
                         w2: w2.clone(),
                         hinting: TrueTypeHinting::default(),
+                        codes_unknown: false,
                     }));
                 }
                 // FontFile3 may be raw CFF or OpenType/CFF (OTTO wrapper)
@@ -3467,6 +3595,9 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
             }
             // Not embedded or tiny subset — substitute with a system font
             {
+                if desc.get(b"FontFile3").is_none() && desc.get(b"FontFile").is_none() {
+                    report_font_not_embedded(resolver);
+                }
                 let base_font = cid_font_dict
                     .get_name(b"BaseFont")
                     .map(|n| String::from_utf8_lossy(n).to_string())
@@ -3544,6 +3675,7 @@ fn resolve_type0(resolver: &Resolver, font_dict: &PdfDict) -> Result<PdfFont, Pd
                     dw2,
                     w2,
                     hinting: TrueTypeHinting::default(),
+                    codes_unknown: false,
                 }))
             }
         }
@@ -3930,6 +4062,12 @@ impl PdfFont {
     /// Whether this is a composite (CID) font that uses multi-byte character codes.
     pub fn is_composite(&self) -> bool {
         matches!(self, PdfFont::CidTrueType(_) | PdfFont::CidCff(_))
+    }
+
+    /// Whether the font's character codes cannot be read, because its
+    /// CMap was not found: text in it is neither drawn nor extracted.
+    pub(crate) fn codes_unknown(&self) -> bool {
+        matches!(self, PdfFont::CidTrueType(f) if f.codes_unknown)
     }
 
     /// Writing mode: 0 = horizontal, 1 = vertical.
@@ -4967,7 +5105,11 @@ mod document_fonts_tests {
         doc.resolver().fonts.borrow_mut().insert(
             FONT,
             font,
-            vec![(Severity::Warning, "something about the font".into())],
+            vec![(
+                ParsePhase::Content,
+                Severity::Warning,
+                "something about the font".into(),
+            )],
         );
 
         doc.render_page(1, 72.0).unwrap();
@@ -4989,20 +5131,23 @@ mod document_fonts_tests {
         let pdf = two_pages();
         let doc = PdfDocument::from_bytes(&pdf).unwrap();
         let resolver = doc.resolver();
-        let (value, captured) = resolver.capturing_content_warnings(|| {
+        let (value, captured) = resolver.capturing_page_warnings(|| {
             resolver.warn_content(Severity::Warning, "outer");
-            let (_, inner) = resolver.capturing_content_warnings(|| {
+            let (_, inner) = resolver.capturing_page_warnings(|| {
                 resolver.warn_content(Severity::Info, "inner");
             });
-            assert_eq!(inner, [(Severity::Info, "inner".to_string())]);
+            assert_eq!(
+                inner,
+                [(ParsePhase::Content, Severity::Info, "inner".to_string())]
+            );
             7
         });
         assert_eq!(value, 7);
         assert_eq!(
             captured,
             [
-                (Severity::Warning, "outer".to_string()),
-                (Severity::Info, "inner".to_string())
+                (ParsePhase::Content, Severity::Warning, "outer".to_string()),
+                (ParsePhase::Content, Severity::Info, "inner".to_string())
             ]
         );
         resolver.warn_content(Severity::Warning, "afterwards");

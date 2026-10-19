@@ -528,7 +528,17 @@ impl<'a> PdfDocument<'a> {
             None
         };
 
+        let xref_rebuilt = xref.rebuilt_by_scan();
         let resolver = Resolver::from_source(source, xref, encryption);
+        if xref_rebuilt {
+            resolver.warnings().record(
+                ParsePhase::CrossReference,
+                None,
+                Severity::Info,
+                "the cross-reference table is missing or damaged; \
+                 it was rebuilt by scanning the file for objects",
+            );
+        }
         let (pages, box_notes) = page_tree::collect_pages_noted(&resolver)?;
         for (page, message) in box_notes {
             resolver.warnings().record(
@@ -648,8 +658,9 @@ impl<'a> PdfDocument<'a> {
     /// `/Width` times `/Height` in its dictionary.
     ///
     /// An image over the limit is left out of the page, with a
-    /// [`ParsePhase::Content`] warning in
-    /// [`parse_warnings`](Self::parse_warnings) that names its size.
+    /// [`ParsePhase::ImageLeftOut`] warning in
+    /// [`parse_warnings`](Self::parse_warnings) for that page, which
+    /// carries the image's size as the file stores it.
     pub fn set_max_image_pixels(&mut self, limit: Option<u64>) {
         self.resolver
             .set_max_image_pixels(limit.unwrap_or(stet_graphics::image_limits::MAX_IMAGE_PIXELS));
@@ -865,6 +876,19 @@ impl<'a> PdfDocument<'a> {
             // in malformed PDFs). Continue with remaining streams.
             match self.resolver.stream_data(obj_num, gen_num) {
                 Ok(data) => {
+                    if self
+                        .resolver
+                        .stream_cut_short(&PdfObj::Ref(obj_num, gen_num))
+                    {
+                        self.resolver.warn_content_on(
+                            Some(page),
+                            Severity::Warning,
+                            format!(
+                                "content stream {obj_num} {gen_num} is cut short by the end of the file; \
+                                 what it holds past that is missing"
+                            ),
+                        );
+                    }
                     if i > 0 && !result.is_empty() {
                         result.push(b'\n');
                     }
