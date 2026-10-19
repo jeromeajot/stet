@@ -6,6 +6,9 @@
 //! [`MAX_SAVED_STATES`] graphics states saved at once, and the bytes of
 //! content set with `PdfDocument::set_max_content_bytes`.
 //!
+//! Both count the forms the page draws and the appearances of its
+//! annotations and form fields.
+//!
 //! A page over either is not drawn. `render_page` returns
 //! `PdfError::ContentLimit`, which is its own kind of error, nothing is
 //! added to the parse warnings for it, and the document's other pages read
@@ -350,4 +353,97 @@ fn a_page_within_the_limits_reads_as_it_does_without_them() {
     assert_eq!(text_of(&with), text_of(&without));
     assert_eq!(format!("{with:?}"), format!("{without:?}"));
     assert!(limited.parse_warnings().is_empty());
+}
+
+/// A page with `content`, a form field and a square annotation, both drawn
+/// by the one appearance stream `appearance`, which shows its text in the
+/// page's font.
+fn annotated(content: &[u8], appearance: &[u8]) -> Vec<u8> {
+    pdf_from(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+           /Resources << /Font << /F1 8 0 R >> >> /Annots [5 0 R 6 0 R] >>"
+            .to_vec(),
+        stream("", content),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /P 3 0 R \
+           /Rect [72 600 272 620] /AP << /N 7 0 R >> >>"
+            .to_vec(),
+        b"<< /Type /Annot /Subtype /Square /P 3 0 R \
+           /Rect [72 500 272 520] /AP << /N 7 0 R >> >>"
+            .to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 20] \
+             /Resources << /Font << /F1 8 0 R >> >>",
+            appearance,
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    ])
+}
+
+/// An appearance that saves `count` levels of `q` around its text.
+fn appearance_saving(count: usize) -> Vec<u8> {
+    let mut appearance = b"q ".repeat(count);
+    appearance.extend(b"BT /F1 12 Tf 2 5 Td (shown) Tj ET ");
+    appearance.extend(b"Q ".repeat(count));
+    appearance
+}
+
+/// The saves in the appearance of an annotation or a form field count
+/// toward the limit as the page's own do.
+#[test]
+fn the_states_an_appearance_saves_count_toward_the_limit() {
+    let page = b"BT /F1 12 Tf 72 700 Td (page) Tj ET";
+    let at_limit = annotated(page, &appearance_saving(MAX_SAVED_STATES));
+    let doc = open(&at_limit);
+    assert_eq!(
+        text_of(&doc.render_page(0, 72.0).unwrap()),
+        ["page", "shown", "shown"]
+    );
+
+    let over = annotated(page, &appearance_saving(MAX_SAVED_STATES + 1));
+    let doc = open(&over);
+    let err = doc.render_page(0, 72.0).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            PdfError::ContentLimit(ContentLimit::SavedStates(MAX_SAVED_STATES))
+        ),
+        "{err:?}"
+    );
+    assert!(
+        doc.parse_warnings().is_empty(),
+        "{:?}",
+        doc.parse_warnings()
+    );
+}
+
+/// The appearance of a form field and of an annotation count toward the
+/// byte limit each time one is drawn: here one stream draws both.
+#[test]
+fn an_appearance_counts_each_time_it_is_drawn() {
+    let page = b"BT /F1 12 Tf 72 700 Td (page) Tj ET";
+    let appearance = b"BT /F1 12 Tf 2 5 Td (shown) Tj ET";
+    let pdf = annotated(page, appearance);
+    let all = (page.len() + 2 * appearance.len()) as u64;
+
+    let mut doc = open(&pdf);
+    doc.set_max_content_bytes(Some(all));
+    assert_eq!(
+        text_of(&doc.render_page(0, 72.0).unwrap()),
+        ["page", "shown", "shown"]
+    );
+
+    doc.set_max_content_bytes(Some(all - 1));
+    let err = doc.render_page(0, 72.0).unwrap_err();
+    assert!(
+        matches!(err, PdfError::ContentLimit(ContentLimit::ContentBytes(l)) if l == all - 1),
+        "{err:?}"
+    );
+    assert!(
+        doc.parse_warnings().is_empty(),
+        "{:?}",
+        doc.parse_warnings()
+    );
 }
