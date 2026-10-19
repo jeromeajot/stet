@@ -38,7 +38,7 @@ pub struct ParseWarning {
 }
 
 /// The structural area a warning came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ParsePhase {
     Metadata,
@@ -88,7 +88,8 @@ pub enum ParsePhase {
     /// may be larger than the size it would have been decoded at.
     ///
     /// Recorded as pages are rendered, once for each page and size: an
-    /// image used on two pages is reported for each of them.
+    /// image used on two pages is reported for each of them. A page lists
+    /// at most 64 of them; the rest of what it leaves out is not listed.
     ImageLeftOut {
         width: u32,
         height: u32,

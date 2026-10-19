@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The page is now a `PageTree` warning naming the object, and the pages
   after it are read. A page list found by scanning the file, because the
   page tree cannot be followed, is a `PageTree` warning too; it was
-  silent.
+  silent. Opening lists at most 64 page tree warnings, so a `/Kids`
+  array naming any number of missing objects opens as quickly as one.
 
 ### Fixed
 

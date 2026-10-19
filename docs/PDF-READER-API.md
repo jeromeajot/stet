@@ -773,7 +773,8 @@ apart without reading messages. Each is recorded for the page, in
 | `MissingFont` | a font is not embedded and is not one of the standard 14, which the reader carries. A substitute is drawn, so its text is still read |
 | `MissingCMap` | a composite font names a predefined CMap that is not embedded and not found (see `STET_CMAP_DIR` in [ARCHITECTURE.md](ARCHITECTURE.md#cjk-cmap-files-pdf-reader)). Without it the codes cannot be read, so the text in that font is neither drawn nor extracted. `Identity-H` and `Identity-V` need no file and are never reported |
 
-Neither message names the font or the CMap. A font or CMap that is
+A page lists at most 64 warnings of each of these kinds. Neither message
+names the font or the CMap. A font or CMap that is
 embedded but cannot be read is a fault in the file, and is a
 `ParsePhase::Content` warning instead.
 
@@ -789,7 +790,9 @@ as `LocationHint::Object`. When the tree cannot be followed at all, the
 pages are found by scanning the file for page objects, which may miss
 some or include ones an update replaced; that is a `PageTree` warning
 too. A document that opens with fewer pages than expected, or none, is
-worth checking for these. All are `Severity::Warning`.
+worth checking for these. All are `Severity::Warning`. Opening lists at
+most 64 of them, then one last warning, "further problems with the page
+tree are not listed; more pages may be left out".
 
 `ParsePhase::CrossReference` is recorded, as `Severity::Info`, when the
 file's cross-reference table is missing or damaged and the reader

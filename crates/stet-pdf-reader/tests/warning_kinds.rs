@@ -321,6 +321,71 @@ fn a_page_that_cannot_be_loaded_is_a_page_tree_warning() {
     );
 }
 
+/// A tree naming a great many objects that are not in the file lists the
+/// first 64 and then says the list is cut short, rather than one warning
+/// for each: every warning recorded is checked against those before it,
+/// and opening the file cannot be cancelled.
+#[test]
+fn a_page_tree_lists_a_bounded_number_of_warnings() {
+    let mut objects = two_page_objects("", FINE, FINE, Vec::new());
+    let missing: String = (100..400).map(|n| format!("{n} 0 R ")).collect();
+    objects[1] = format!("<< /Type /Pages /Kids [3 0 R {missing}5 0 R] /Count 2 >>").into_bytes();
+    let pdf = pdf_from(&objects);
+    let doc = PdfDocument::from_bytes(&pdf).unwrap();
+    assert_eq!(doc.page_count(), 2);
+    let warnings = doc.parse_warnings();
+    assert_eq!(warnings.len(), 65, "{:?}", warnings.last());
+    assert!(warnings.iter().all(|w| w.phase == ParsePhase::PageTree));
+    assert_eq!(
+        warnings[63].location,
+        Some(LocationHint::Object {
+            obj_num: 163,
+            gen_num: 0
+        })
+    );
+    assert_eq!(warnings[64].location, None);
+    assert!(
+        warnings[64].message.contains("not listed"),
+        "{:?}",
+        warnings[64]
+    );
+}
+
+/// A page with a hundred images over the ceiling, each a different size,
+/// lists the first 64 of them. Other kinds have limits of their own: the
+/// font the page does not embed is still reported after them.
+#[test]
+fn a_page_lists_a_bounded_number_of_images_left_out() {
+    let images: String = (0..100)
+        .map(|i| format!("BI /W {} /H 400 /BPC 8 /CS /G ID \u{0} EI\n", 300 + i))
+        .collect();
+    let content = format!("{images}BT /F1 12 Tf 10 10 Td (x) Tj ET");
+    let font = "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Garamond >> >>";
+    let pdf = pdf_from(&two_page_objects(font, &content, FINE, Vec::new()));
+    let mut doc = PdfDocument::from_bytes(&pdf).unwrap();
+    doc.set_max_image_pixels(Some(100_000));
+    doc.render_page(0, 72.0).unwrap();
+    let warnings = doc.parse_warnings();
+    let left_out: Vec<_> = warnings
+        .iter()
+        .filter(|w| matches!(w.phase, ParsePhase::ImageLeftOut { .. }))
+        .collect();
+    assert_eq!(left_out.len(), 64);
+    assert_eq!(
+        left_out[63].phase,
+        ParsePhase::ImageLeftOut {
+            width: 363,
+            height: 400
+        }
+    );
+    assert!(
+        warnings.iter().any(
+            |w| w.phase == ParsePhase::MissingFont && w.location == Some(LocationHint::Page(0))
+        ),
+        "{warnings:?}"
+    );
+}
+
 // === Content cut short ======================================================
 
 /// A file cut off part-way through the second page's content stream. The

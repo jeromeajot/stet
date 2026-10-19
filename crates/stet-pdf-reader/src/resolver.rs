@@ -74,6 +74,10 @@ pub struct Resolver<'a> {
     /// their messages. It is what makes a repeated warning cheap, and what
     /// [`MAX_CONTENT_WARNINGS_PER_PAGE`] counts.
     content_seen: RefCell<(Option<usize>, HashSet<String>)>,
+    /// The same for the page warnings of other kinds: which page, and the
+    /// warnings it has given of each, counted by kind for
+    /// [`MAX_WARNINGS_OF_A_KIND_PER_PAGE`].
+    kinds_seen: RefCell<PageKindsSeen>,
     /// Most samples an image may have and still be decoded: the
     /// application's ceiling, or the built-in one.
     max_image_pixels: std::cell::Cell<u64>,
@@ -90,6 +94,23 @@ pub struct Resolver<'a> {
     /// running, innermost last.
     content_capture: RefCell<Vec<Vec<PageWarning>>>,
 }
+
+/// The page warnings other than content warnings one page has given: see
+/// [`Resolver::warn_page`].
+#[derive(Default)]
+struct PageKindsSeen {
+    page: Option<usize>,
+    warnings: HashSet<(crate::diagnostics::ParsePhase, String)>,
+    per_kind: HashMap<std::mem::Discriminant<crate::diagnostics::ParsePhase>, usize>,
+}
+
+/// Most distinct warnings of one kind other than
+/// [`Content`](crate::diagnostics::ParsePhase::Content) kept for one page.
+///
+/// An image left out carries its size, so a hostile content stream can
+/// make every one of those different too. Past this many the rest are not
+/// recorded: the page has already said it lost images.
+const MAX_WARNINGS_OF_A_KIND_PER_PAGE: usize = 64;
 
 /// Most distinct content warnings kept for one page.
 ///
@@ -217,10 +238,33 @@ impl<'a> Resolver<'a> {
         let page = self.content_page.get();
         if phase == ParsePhase::Content {
             self.warn_content_on(page, severity, message);
-        } else {
-            self.warnings
-                .record_if_new(phase, page.map(LocationHint::Page), severity, message);
+            return;
         }
+        // As for content warnings: a repeat is found without searching the
+        // document's whole list, and a page keeps a bounded number.
+        let mut seen = self.kinds_seen.borrow_mut();
+        if seen.page != page {
+            *seen = PageKindsSeen {
+                page,
+                ..PageKindsSeen::default()
+            };
+        }
+        let key = (phase, message);
+        if seen.warnings.contains(&key) {
+            return;
+        }
+        let count = seen
+            .per_kind
+            .entry(std::mem::discriminant(&key.0))
+            .or_default();
+        if *count >= MAX_WARNINGS_OF_A_KIND_PER_PAGE {
+            return;
+        }
+        *count += 1;
+        seen.warnings.insert(key.clone());
+        let (phase, message) = key;
+        self.warnings
+            .record_if_new(phase, page.map(LocationHint::Page), severity, message);
     }
 
     /// Run `work`, and return with its result the page warnings it
@@ -351,6 +395,7 @@ impl<'a> Resolver<'a> {
             warnings: crate::diagnostics::WarningSink::new(),
             content_page: std::cell::Cell::new(None),
             content_seen: RefCell::new((None, HashSet::new())),
+            kinds_seen: RefCell::default(),
             fonts: RefCell::default(),
             icc_profiles: RefCell::new(HashMap::new()),
             content_capture: RefCell::default(),
@@ -388,6 +433,7 @@ impl<'a> Resolver<'a> {
             warnings: crate::diagnostics::WarningSink::new(),
             content_page: std::cell::Cell::new(None),
             content_seen: RefCell::new((None, HashSet::new())),
+            kinds_seen: RefCell::default(),
             fonts: RefCell::default(),
             icc_profiles: RefCell::new(HashMap::new()),
             content_capture: RefCell::default(),
