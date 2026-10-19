@@ -239,6 +239,37 @@ fn a_predefined_cmap_that_is_not_found_is_its_own_kind_and_its_text_is_left_out(
     assert_eq!(elements(&pdf), elements(&latin_only));
 }
 
+/// A UCS-2 CMap is the one exception: its codes are Unicode, two bytes
+/// each, so the text in its font is read from them even when the CMap is
+/// not found. The CMap is still reported as missing, for each page, and
+/// nothing is a content warning.
+#[test]
+fn a_ucs2_cmap_that_is_not_found_is_its_own_kind_and_its_text_is_read() {
+    if let Some(found) = installed_cmap("UniGB-UCS2-H") {
+        panic!(
+            "UniGB-UCS2-H is installed at {}, where the reader finds it; \
+             this test needs a machine without it",
+            found.display()
+        );
+    }
+    let font = "<< /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /UniGB-UCS2-H \
+                /DescendantFonts [8 0 R] >>";
+    let (_, extra) = composite_font("UniGB-UCS2-H");
+    // "SSN 12", two bytes a character.
+    let content = "BT /F1 12 Tf 10 60 Td (Latin value) Tj ET \
+                   BT /F2 12 Tf 10 30 Td <00530053004E00200031> Tj <0032> Tj ET";
+    let (texts, warnings) = read(&two_pages(font, content, &extra[..2]));
+
+    assert_eq!(of_kind(&warnings, ParsePhase::MissingCMap), both_pages());
+    assert_eq!(of_kind(&warnings, ParsePhase::Content), []);
+    assert_eq!(texts, ["Latin valueSSN 12", "Latin valueSSN 12"]);
+    for w in &warnings {
+        for name in ["UCS2", "UniGB", "SimSun"] {
+            assert!(!w.message.contains(name), "{w:?} names {name}");
+        }
+    }
+}
+
 /// A CMap name that no machine has is reported the same way.
 #[test]
 fn a_cmap_no_machine_has_is_its_own_kind() {
