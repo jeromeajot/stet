@@ -4905,7 +4905,9 @@ impl<'a> ContentInterpreter<'a> {
                         &e,
                     );
                 }
-                other => other?,
+                Err(e @ PdfError::ContentLimit(_)) => return Err(e),
+                Err(e) => self.report_image_unreadable(&e),
+                Ok(()) => {}
             },
             b"Form" => self.handle_form_xobject(&xobj_ref_clone, dict)?,
             _ => {}
@@ -5253,6 +5255,16 @@ impl<'a> ContentInterpreter<'a> {
             ParsePhase::ImageLeftOut { width, height },
             Severity::Warning,
             format!("{refusal}; the image is left out"),
+        );
+    }
+
+    /// Say that an image XObject could not be drawn, for `failure`, and is
+    /// left out of the page.
+    fn report_image_unreadable(&self, failure: &PdfError) {
+        self.resolver.warn_page(
+            ParsePhase::ImageUnreadable,
+            Severity::Warning,
+            format!("image cannot be read: {failure}; the image is left out"),
         );
     }
 

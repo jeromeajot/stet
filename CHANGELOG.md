@@ -58,6 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the error `PdfError::ImageOverLimit`, where it was `PdfError::Other`.
   See `docs/PDF-READER-API.md`, "Images, fonts and CMaps left out".
 
+- **An image that cannot be read is reported by its kind, and the rest
+  of its page is drawn.** An image XObject whose data cannot be decoded
+  (a JPEG cut short) or whose dictionary cannot be used was a `Content`
+  warning naming the `Do` operator, with nothing to tell it from content
+  the page lost. It is now `ParsePhase::ImageUnreadable`, for the page it
+  is on, and its message says what failed; the image is left out as
+  before. An inline image that cannot be read is still a `Content`
+  warning. See `docs/PDF-READER-API.md`, "Images, fonts and CMaps left
+  out".
+
 ### Changed
 
 - **A document opened with `from_bytes` or `from_owned` looks for the
