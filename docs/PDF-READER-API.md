@@ -848,7 +848,7 @@ problems with this page's content are not listed".
 
 ### Images, fonts and CMaps left out
 
-Three things a page can lose are reported as kinds of their own rather
+Four things a page can lose are reported as kinds of their own rather
 than as `ParsePhase::Content`, so that an application can tell them
 apart without reading messages. Each is recorded for the page, in
 `location` as `LocationHint::Page`, once for each page that has it:
@@ -856,6 +856,7 @@ apart without reading messages. Each is recorded for the page, in
 | Phase | What happened |
 |---|---|
 | `ImageLeftOut { width, height }` | an image has more samples than [`set_max_image_pixels`](#a-ceiling-on-image-size) allows and is left out. `width` and `height` are its size as the file stores it, which for a JPEG 2000 image drawn small is larger than the size it would have been decoded at; the message says what was over the limit, which may be the image's soft mask |
+| `ImageUnreadable` | an image XObject cannot be drawn: its data cannot be decoded (a JPEG cut short, a stream its filter cannot read) or its dictionary cannot be used. It is left out and the rest of the page is drawn; the message says what failed. An inline image that cannot be read is still a `Content` warning |
 | `MissingFont` | a font is not embedded and is not one of the standard 14, which the reader carries. A substitute is drawn, so its text is still read |
 | `MissingCMap` | a composite font names a predefined CMap that is not embedded and not found (see `STET_CMAP_DIR` in [ARCHITECTURE.md](ARCHITECTURE.md#cjk-cmap-files-pdf-reader)). Without it the codes cannot be read, so the text in that font is neither drawn nor extracted. `Identity-H` and `Identity-V` need no file and are never reported |
 
