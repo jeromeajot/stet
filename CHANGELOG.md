@@ -43,12 +43,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a damaged page by kind. The other pages read as before. See
   `docs/PDF-READER-API.md`, "A ceiling on page content".
 
+- **What the PDF reader repaired or left out is reported by its kind.**
+  Four new `ParsePhase` variants let an application tell these apart in
+  `parse_warnings` without reading messages. `ImageLeftOut { width,
+  height }` is an image over the `set_max_image_pixels` ceiling, for the
+  page it is on, with its size as the file stores it rather than the
+  reduced size a JPEG 2000 image is measured at; it was a `Content`
+  warning. `MissingFont` is a font that is not embedded and is not one of
+  the standard 14, drawn with a substitute; this was not reported at all.
+  `MissingCMap` is a predefined CMap that is neither embedded nor found;
+  it was a `Content` warning. `CrossReference`, at `Severity::Info`, is a
+  cross-reference table rebuilt by scanning the file, which was silent.
+  None of the messages names a font or a CMap. An image left out is also
+  the error `PdfError::ImageOverLimit`, where it was `PdfError::Other`.
+  See `docs/PDF-READER-API.md`, "Images, fonts and CMaps left out".
+
 ### Changed
 
 - **A document opened with `from_bytes` or `from_owned` looks for the
   system's CMYK profile when it first needs its colors, not as it is
   opened.** The profile is the same and is still found once per process;
   opening costs that much less and the first page that much more.
+
+- **Text in a font whose CMap is not found is left out.** Its codes were
+  read two bytes at a time, which for a CMap such as `GBK-EUC-H` drew the
+  wrong glyphs and extracted the wrong text. Without the CMap there is no
+  telling where one code ends and the next begins, so nothing in that
+  font is drawn or extracted now. A UCS-2 CMap, whose codes are Unicode,
+  is read as before.
+- **A page the page tree names that cannot be read is left out, and the
+  document opens.** It failed to open with the error of that one object.
+  The page is now a `PageTree` warning naming the object, and the pages
+  after it are read. A page list found by scanning the file, because the
+  page tree cannot be followed, is a `PageTree` warning too; it was
+  silent. Opening lists at most 64 page tree warnings, so a `/Kids`
+  array naming any number of missing objects opens as quickly as one.
+
+### Fixed
+
+- **A content stream cut short by the end of the file says so.** A
+  truncated file's last content stream, of a page or of a form, was read
+  as far as the file went with nothing to say that the rest was missing.
+  It is now a `Content` warning for the page.
+- **An embedded font program or CMap that cannot be read is a `Content`
+  warning.** A substitute font, or two-byte codes, were used in their
+  place without a word.
 
 ## [0.8.7] — 2026-10-14
 

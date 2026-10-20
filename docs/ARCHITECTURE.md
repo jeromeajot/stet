@@ -733,8 +733,12 @@ Search order:
   [Adobe CMap resources](https://github.com/nicferrier/python-ghostscript/tree/master/ghostscript/CMap)
   and either set `STET_CMAP_DIR` or place them in `~/.local/share/stet/CMap/`
 
-If a required CMap is not found, a warning is printed and CJK text in the
-affected font will not render correctly.
+If a required CMap is not found, the page reports it as
+`ParsePhase::MissingCMap` and the text in the affected font is left out:
+without the CMap there is no telling where one character code ends and
+the next begins, so nothing is drawn or extracted for it. A UCS-2 CMap
+(`UniJIS-UCS2-H` and the like) is the exception: its codes are Unicode,
+and the Latin ones are still drawn.
 
 ## Crate Dependency Graph
 
