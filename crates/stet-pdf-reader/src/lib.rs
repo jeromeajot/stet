@@ -212,10 +212,11 @@ pub use annotations::{
     MarkupAnnotation, PolygonAnnotation, PopupAnnotation, ShapeAnnotation, StampAnnotation,
     TextAnnotation,
 };
+pub use content::MAX_SAVED_STATES;
 pub use destination::{Action, Destination, ViewSpec};
 pub use diagnostics::{LocationHint, ParsePhase, ParseWarning, Severity, WarningSink};
 pub use embedded_files::{AfRelationship, EmbeddedFile};
-pub use error::PdfError;
+pub use error::{ContentLimit, PdfError};
 pub use form_fields::{
     ButtonField, ButtonType, ChoiceField, ChoiceOption, FieldFlags, FieldKind, FieldValue,
     FormCatalog, FormField, SigFlags, SignatureField, TextField,
@@ -272,6 +273,42 @@ fn default_icc_cache() -> IccCache {
         .clone()
 }
 
+/// stet's own CMYK profile, for a document that may read no file from the
+/// machine: CGATS001Compat-v2-micro, public domain (see
+/// `LICENSE-CMYK-PROFILE`), built from the CGATS TR 001 (SWOP) data.
+const OWN_CMYK_PROFILE: &[u8] = include_bytes!("default_cmyk.icc");
+
+/// [`default_icc_cache`] for a document that may read no file from the
+/// machine: stet's own CMYK profile in place of the system's. Prepared
+/// once per process in the same way.
+fn own_icc_cache() -> IccCache {
+    static TEMPLATE: std::sync::OnceLock<IccCache> = std::sync::OnceLock::new();
+    TEMPLATE
+        .get_or_init(|| {
+            let mut cache = IccCache::new();
+            cache.load_cmyk_profile_bytes(OWN_CMYK_PROFILE);
+            cache
+        })
+        .clone()
+}
+
+/// Where a document's color cache reports what it cannot use: into
+/// `pending`, for [`PdfDocument::note_icc_diagnostics`] to move into the
+/// document's warnings.
+fn icc_diagnostic_sink(
+    pending: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> stet_graphics::icc::IccDiagnosticSink {
+    let pending = Arc::clone(pending);
+    Arc::new(move |message: &str| {
+        if let Ok(mut pending) = pending.lock()
+            && pending.len() < MAX_PENDING_ICC_DIAGNOSTICS
+            && !pending.iter().any(|m: &String| m == message)
+        {
+            pending.push(message.to_owned());
+        }
+    })
+}
+
 /// The most messages from a document's colour cache held between two
 /// readings of them. They are read at the end of every page, so this is
 /// reached only by a page with that many distinct failures.
@@ -313,7 +350,17 @@ pub enum ImageResolution {
 pub struct PdfDocument<'a> {
     resolver: Resolver<'a>,
     pages: Vec<PageInfo>,
-    icc_cache: IccCache,
+    /// The document's color cache: the caller's, or, for a document
+    /// opened without one, made from [`default_icc_cache`] or
+    /// [`own_icc_cache`] when it is first needed. See [`Self::icc`].
+    icc_cache: OnceCell<IccCache>,
+    /// The color cache is one the reader makes, and nothing has changed
+    /// it since: [`Self::set_host_files`] may then make it again.
+    icc_cache_is_default: bool,
+    /// Whether the reader may read files from the machine it runs on:
+    /// installed fonts, CMap files, color profiles. On by default. See
+    /// [`PdfDocument::set_host_files`].
+    host_files: bool,
     /// What `icc_cache`, and the copies of it pages are read with, have
     /// reported and [`Self::note_icc_diagnostics`] has not yet moved into
     /// the document's warnings.
@@ -337,6 +384,9 @@ pub struct PdfDocument<'a> {
     /// Whether rendered pages carry images at full resolution. See
     /// [`PdfDocument::set_image_resolution`].
     image_resolution: ImageResolution,
+    /// Most bytes of content a page may interpret, if a limit is set. See
+    /// [`PdfDocument::set_max_content_bytes`].
+    max_content_bytes: Option<u64>,
     /// Which annotations are drawn when any are. See
     /// [`PdfDocument::set_annotation_filter`].
     annotation_filter: AnnotationFilter,
@@ -404,11 +454,7 @@ impl PdfDocument<'static> {
     /// Everything else is as [`from_bytes`](Self::from_bytes), including
     /// the search for a system CMYK profile.
     pub fn from_owned(data: impl Into<PdfBytes>) -> Result<Self, PdfError> {
-        Self::open(
-            resolver::Source::Owned(data.into()),
-            default_icc_cache(),
-            b"",
-        )
+        Self::open(resolver::Source::Owned(data.into()), None, b"")
     }
 
     /// [`from_owned`](Self::from_owned) with a pre-loaded ICC cache, as
@@ -417,7 +463,7 @@ impl PdfDocument<'static> {
         data: impl Into<PdfBytes>,
         icc_cache: IccCache,
     ) -> Result<Self, PdfError> {
-        Self::open(resolver::Source::Owned(data.into()), icc_cache, b"")
+        Self::open(resolver::Source::Owned(data.into()), Some(icc_cache), b"")
     }
 
     /// [`from_owned`](Self::from_owned) with a password, as
@@ -427,14 +473,18 @@ impl PdfDocument<'static> {
         icc_cache: IccCache,
         password: &[u8],
     ) -> Result<Self, PdfError> {
-        Self::open(resolver::Source::Owned(data.into()), icc_cache, password)
+        Self::open(
+            resolver::Source::Owned(data.into()),
+            Some(icc_cache),
+            password,
+        )
     }
 }
 
 impl<'a> PdfDocument<'a> {
     /// Parse a PDF from bytes.
     pub fn from_bytes(data: &'a [u8]) -> Result<Self, PdfError> {
-        Self::from_bytes_inner(data, default_icc_cache(), b"")
+        Self::from_bytes_inner(data, None, b"")
     }
 
     /// Parse a PDF from bytes, using a pre-loaded ICC cache.
@@ -442,7 +492,7 @@ impl<'a> PdfDocument<'a> {
     /// Use this when the caller already has an `IccCache` with the system
     /// CMYK profile loaded (e.g., from the PostScript interpreter context).
     pub fn from_bytes_with_icc(data: &'a [u8], icc_cache: IccCache) -> Result<Self, PdfError> {
-        Self::from_bytes_inner(data, icc_cache, b"")
+        Self::from_bytes_inner(data, Some(icc_cache), b"")
     }
 
     /// Parse a PDF from bytes using a user-supplied password.
@@ -456,21 +506,23 @@ impl<'a> PdfDocument<'a> {
         icc_cache: IccCache,
         password: &[u8],
     ) -> Result<Self, PdfError> {
-        Self::from_bytes_inner(data, icc_cache, password)
+        Self::from_bytes_inner(data, Some(icc_cache), password)
     }
 
     fn from_bytes_inner(
         data: &'a [u8],
-        icc_cache: IccCache,
+        icc_cache: Option<IccCache>,
         password: &[u8],
     ) -> Result<Self, PdfError> {
         Self::open(resolver::Source::Borrowed(data), icc_cache, password)
     }
 
-    /// Open a document over bytes that are lent or owned.
+    /// Open a document over bytes that are lent or owned, with the
+    /// caller's color cache or, given none, the reader's own when it is
+    /// first needed.
     fn open(
         source: resolver::Source<'a>,
-        mut icc_cache: IccCache,
+        icc_cache: Option<IccCache>,
         password: &[u8],
     ) -> Result<Self, PdfError> {
         // The cache is this document's from here on, and what it cannot
@@ -480,15 +532,14 @@ impl<'a> PdfDocument<'a> {
         // whichever thread is converting, and moved across by
         // `note_icc_diagnostics`.
         let icc_diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let pending = Arc::clone(&icc_diagnostics);
-        icc_cache.set_diagnostic_sink(Some(Arc::new(move |message: &str| {
-            if let Ok(mut pending) = pending.lock()
-                && pending.len() < MAX_PENDING_ICC_DIAGNOSTICS
-                && !pending.iter().any(|m: &String| m == message)
-            {
-                pending.push(message.to_owned());
+        let icc_cache_is_default = icc_cache.is_none();
+        let icc_cache = match icc_cache {
+            Some(mut cache) => {
+                cache.set_diagnostic_sink(Some(icc_diagnostic_sink(&icc_diagnostics)));
+                OnceCell::from(cache)
             }
-        })));
+            None => OnceCell::new(),
+        };
         let data: &[u8] = &source;
         // Validate header — PDF spec allows up to 1024 bytes before %PDF-
         if !has_pdf_header(data) {
@@ -556,12 +607,15 @@ impl<'a> PdfDocument<'a> {
             resolver,
             pages,
             icc_cache,
+            icc_cache_is_default,
+            host_files: true,
             icc_diagnostics,
             font_provider: None,
             overprint: true,
             render_annotations: true,
             annotation_filter: AnnotationFilter::default(),
             image_resolution: ImageResolution::Full,
+            max_content_bytes: None,
             text_extraction: TextExtraction::Off,
             page_area: PageArea::CropBox,
             default_rendering_intent: RenderingIntent::RelativeColorimetric,
@@ -671,6 +725,44 @@ impl<'a> PdfDocument<'a> {
     pub fn max_image_pixels(&self) -> Option<u64> {
         let limit = self.resolver.max_image_pixels();
         (limit < stet_graphics::image_limits::MAX_IMAGE_PIXELS).then_some(limit)
+    }
+
+    /// Stop any page that interprets more than `limit` bytes of content,
+    /// or lift that with `None`.
+    ///
+    /// Nothing is stopped by default: a page's content streams are held
+    /// only to the limit every stream is (512 MiB decoded, more when its
+    /// dictionary says so), and what its forms, patterns and glyph
+    /// procedures run to only to the bound on nested work, because a
+    /// heavy page of vector art legitimately reaches a hundred megabytes.
+    /// An application that reads files it did not write can set something
+    /// lower, so that what a page costs to read is bounded by what it
+    /// allows, however small the file: a few kilobytes of Flate can
+    /// decode to hundreds of megabytes of operators.
+    ///
+    /// What is counted is the decoded bytes of the page's content streams,
+    /// joined, then of every form, pattern cell, soft-mask group, Type 3
+    /// glyph procedure and annotation appearance the page runs, each time
+    /// it runs: a form drawn ten times counts ten times. Every one of
+    /// them but a glyph procedure is decoded no further than what is
+    /// left, so the limit bounds the memory decoding takes as well as the
+    /// time interpreting does. A Type 3 font's glyph procedures are
+    /// decoded in full when the font is loaded, held only to the limit
+    /// every stream is, and count toward this one each time they run.
+    ///
+    /// A page that passes it is not drawn: [`render_page`](Self::render_page)
+    /// returns [`PdfError::ContentLimit`] with
+    /// [`ContentLimit::ContentBytes`], and nothing is added to
+    /// [`parse_warnings`](Self::parse_warnings) for it. The other pages are
+    /// read as before.
+    pub fn set_max_content_bytes(&mut self, limit: Option<u64>) {
+        self.max_content_bytes = limit;
+    }
+
+    /// The limit set by
+    /// [`set_max_content_bytes`](Self::set_max_content_bytes), if one is.
+    pub fn max_content_bytes(&self) -> Option<u64> {
+        self.max_content_bytes
     }
 
     /// Choose which annotations rendered pages draw, by purpose and by
@@ -827,6 +919,63 @@ impl<'a> PdfDocument<'a> {
         self.resolver.fonts.borrow_mut().clear();
     }
 
+    /// Let the reader read files from the machine it runs on, or read
+    /// none but the document.
+    ///
+    /// On by default. A font the document names but does not carry is
+    /// then looked for among the fonts installed on the machine, which
+    /// are listed the first time and the list kept in
+    /// `~/.cache/stet/system_fonts.json`. A CMap it names and does not
+    /// carry is looked for in `STET_CMAP_DIR`, `~/.local/share/stet/CMap`
+    /// and the folders poppler and Ghostscript keep theirs in. And a
+    /// document opened without a color cache, by
+    /// [`from_bytes`](Self::from_bytes) or
+    /// [`from_owned`](PdfDocument::from_owned), takes the system's CMYK
+    /// profile from the ColorSync folders, `/usr/share/color/icc` or
+    /// Windows' spool color folder.
+    ///
+    /// Off, none of that is read, nor any other file: for an application
+    /// reading files it did not write, on a machine whose fonts and
+    /// settings are not the document's business. A font not carried is
+    /// drawn with stet's own fonts, the URW base 35, and its text is read
+    /// as the document encodes it. That holds for a composite font too,
+    /// though only the characters those Latin fonts have glyphs for are
+    /// drawn. A predefined CMap not carried is reported as not found, as
+    /// it is when no folder has it, and no name from the document becomes
+    /// a path. A document opened without a color cache takes stet's own
+    /// CMYK profile, and so does a cache given with no CMYK profile in it;
+    /// a cache given with one is used as it is.
+    ///
+    /// Set it before the first page is read. The fonts resolved so far are
+    /// resolved again, and a color cache the reader made is made again,
+    /// unless [`apply_output_intent_as_default_cmyk`](Self::apply_output_intent_as_default_cmyk)
+    /// has changed it; the system's profile is looked for only when the
+    /// cache is first needed, so a document switched off before then never
+    /// reads it. stet's profile, once put in a cache given, stays there.
+    pub fn set_host_files(&mut self, enabled: bool) {
+        if enabled == self.host_files {
+            return;
+        }
+        self.host_files = enabled;
+        self.resolver.set_host_files(enabled);
+        // What a font resolves to depends on what may be read.
+        self.resolver.fonts.borrow_mut().clear();
+        if self.icc_cache_is_default {
+            self.icc_cache = OnceCell::new();
+        } else if !enabled
+            && let Some(cache) = self.icc_cache.get_mut()
+            && cache.default_cmyk_hash().is_none()
+        {
+            cache.load_cmyk_profile_bytes(OWN_CMYK_PROFILE);
+        }
+    }
+
+    /// Whether the reader may read files from the machine: see
+    /// [`set_host_files`](Self::set_host_files).
+    pub fn host_files(&self) -> bool {
+        self.host_files
+    }
+
     /// Number of pages in the document.
     pub fn page_count(&self) -> usize {
         self.pages.len()
@@ -861,6 +1010,13 @@ impl<'a> PdfDocument<'a> {
     /// If the page has multiple content streams, they are concatenated
     /// with a newline separator.
     pub fn page_contents(&self, page: usize) -> Result<Vec<u8>, PdfError> {
+        self.page_contents_within(page, None)
+    }
+
+    /// [`page_contents`](Self::page_contents), no longer than `limit`
+    /// bytes when one is given: past it, decoding stops and the result is
+    /// [`ContentLimit::ContentBytes`].
+    fn page_contents_within(&self, page: usize, limit: Option<u64>) -> Result<Vec<u8>, PdfError> {
         let info = self
             .pages
             .get(page)
@@ -872,27 +1028,42 @@ impl<'a> PdfDocument<'a> {
 
         let mut result = Vec::new();
         for (i, &(obj_num, gen_num)) in info.contents.iter().enumerate() {
+            let separator = usize::from(i > 0 && !result.is_empty());
+            let allowance = limit.map(|max| {
+                usize::try_from(max.saturating_sub((result.len() + separator) as u64))
+                    .unwrap_or(usize::MAX)
+            });
             // Skip content stream refs that fail (e.g., dict without stream body
             // in malformed PDFs). Continue with remaining streams.
-            match self.resolver.stream_data(obj_num, gen_num) {
+            let read = self
+                .resolver
+                .stream_data_within(obj_num, gen_num, allowance);
+            if read.is_ok()
+                && self
+                    .resolver
+                    .stream_cut_short(&PdfObj::Ref(obj_num, gen_num))
+            {
+                self.resolver.warn_content_on(
+                    Some(page),
+                    Severity::Warning,
+                    format!(
+                        "content stream {obj_num} {gen_num} is cut short by the end of the file; \
+                         what it holds past that is missing"
+                    ),
+                );
+            }
+            match read {
+                Ok(data) if result.is_empty() => result = data,
                 Ok(data) => {
-                    if self
-                        .resolver
-                        .stream_cut_short(&PdfObj::Ref(obj_num, gen_num))
-                    {
-                        self.resolver.warn_content_on(
-                            Some(page),
-                            Severity::Warning,
-                            format!(
-                                "content stream {obj_num} {gen_num} is cut short by the end of the file; \
-                                 what it holds past that is missing"
-                            ),
-                        );
-                    }
-                    if i > 0 && !result.is_empty() {
+                    if separator == 1 {
                         result.push(b'\n');
                     }
                     result.extend_from_slice(&data);
+                }
+                Err(PdfError::ContentLimit(_)) => {
+                    return Err(PdfError::ContentLimit(ContentLimit::ContentBytes(
+                        limit.unwrap_or_default(),
+                    )));
                 }
                 Err(e) => self.resolver.warn_content_on(
                     Some(page),
@@ -1035,14 +1206,14 @@ impl<'a> PdfDocument<'a> {
         if cancel_requested() {
             return Ok(None);
         }
-        let content_data = self.page_contents(page)?;
+        let content_data = self.page_contents_within(page, self.max_content_bytes)?;
 
         // Interpret content stream
         let mut interpreter = ContentInterpreter::new(
             &self.resolver,
             info.resources.clone(),
             ctm,
-            &self.icc_cache,
+            self.icc(),
             self.font_provider.clone(),
             self.overprint,
             &self.ocg_off,
@@ -1107,6 +1278,9 @@ impl<'a> PdfDocument<'a> {
         if let Some(cancel) = cancel {
             interpreter.set_cancel_flag(cancel);
         }
+        if let Some(limit) = self.max_content_bytes {
+            interpreter.set_max_content_bytes(limit, content_data.len() as u64);
+        }
 
         // Render page content
         if let Err(e) = interpreter.interpret_stream_public(&content_data) {
@@ -1120,7 +1294,7 @@ impl<'a> PdfDocument<'a> {
         if self.render_annotations && !info.annots.is_empty() {
             interpreter.reset_clip_for_annotations();
             for &(n, g) in &info.annots {
-                if interpreter.was_cancelled() {
+                if interpreter.was_cancelled() || interpreter.content_limit().is_some() {
                     break;
                 }
                 let _ = interpreter.render_annotation(n, g);
@@ -1129,6 +1303,9 @@ impl<'a> PdfDocument<'a> {
 
         // Still within the page, so that these are reported for it.
         self.note_icc_diagnostics(Some(page));
+        if let Some(limit) = interpreter.content_limit() {
+            return Err(PdfError::ContentLimit(limit));
+        }
         if interpreter.was_cancelled() {
             return Ok(None);
         }
@@ -1202,7 +1379,7 @@ impl<'a> PdfDocument<'a> {
             pixel_w,
             pixel_h,
             dpi,
-            Some(&self.icc_cache),
+            Some(self.icc()),
             false,
             layer_set,
             background,
@@ -1230,8 +1407,28 @@ impl<'a> PdfDocument<'a> {
     }
 
     /// Access the ICC color profile cache.
+    ///
+    /// For a document opened without one, the reader's own: with the
+    /// system's CMYK profile, or stet's when
+    /// [`set_host_files`](Self::set_host_files) is off.
     pub fn icc_cache(&self) -> &IccCache {
-        &self.icc_cache
+        self.icc()
+    }
+
+    /// The document's color cache, made when it is first needed for a
+    /// document opened without one. The system's CMYK profile is looked
+    /// for only then, so that a document told not to read the machine's
+    /// files before its first page never does.
+    fn icc(&self) -> &IccCache {
+        self.icc_cache.get_or_init(|| {
+            let mut cache = if self.host_files {
+                default_icc_cache()
+            } else {
+                own_icc_cache()
+            };
+            cache.set_diagnostic_sink(Some(icc_diagnostic_sink(&self.icc_diagnostics)));
+            cache
+        })
     }
 
     /// Decompressed ICC profile bytes from the PDF's OutputIntent, if any.
@@ -1248,7 +1445,16 @@ impl<'a> PdfDocument<'a> {
     /// `search_system_cmyk_profile`. Returns `true` when the profile was
     /// present and registered.
     pub fn apply_output_intent_as_default_cmyk(&mut self) -> bool {
-        let Some(bytes) = self.output_intent_icc.as_deref() else {
+        if self.output_intent_icc.is_none() {
+            return false;
+        }
+        // The cache is changed, so it is the document's from now on, and
+        // the reader does not make it again.
+        self.icc();
+        self.icc_cache_is_default = false;
+        let (Some(bytes), Some(icc_cache)) =
+            (self.output_intent_icc.as_deref(), self.icc_cache.get_mut())
+        else {
             return false;
         };
         // Compute the profile hash and install it as the default CMYK BEFORE
@@ -1259,12 +1465,12 @@ impl<'a> PdfDocument<'a> {
         // colours converge with DeviceCMYK paints at the final
         // `OutputIntent → sRGB` stage.
         let hash = stet_graphics::icc::IccCache::hash_profile(bytes);
-        self.icc_cache.set_system_cmyk(bytes, hash);
-        self.icc_cache.set_proofing_enabled(true);
-        if self.icc_cache.register_profile(bytes).is_none() {
+        icc_cache.set_system_cmyk(bytes, hash);
+        icc_cache.set_proofing_enabled(true);
+        if icc_cache.register_profile(bytes).is_none() {
             // Registration failed — undo the partial install so the cache
             // doesn't claim a profile it can't actually use.
-            self.icc_cache.set_proofing_enabled(false);
+            icc_cache.set_proofing_enabled(false);
             return false;
         }
         // Pre-warm the sRGB → CMYK reverse transform so band renderers, which
@@ -1277,12 +1483,12 @@ impl<'a> PdfDocument<'a> {
         // GWG 22.1's ColorBurn form over a Lab BG) reads from the buffer.
         // The viewer's `build_icc_cache_for_list` already calls this; doing
         // it here keeps the PNG path and the viewer in lockstep.
-        self.icc_cache.prepare_reverse_cmyk();
+        icc_cache.prepare_reverse_cmyk();
         // Also pre-build the `Lab → OI CMYK` samplers so Lab fills can take
         // a direct ACE-style path through the OI's B2A LUTs, instead of going
         // through Lab → sRGB → ICC reverse (which drifts under CMYK-group
         // blends — same GWG 22.1 ColorBurn pattern as above).
-        self.icc_cache.prepare_lab_to_oi_cmyk();
+        icc_cache.prepare_lab_to_oi_cmyk();
         true
     }
 

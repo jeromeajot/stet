@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`PdfDocument::set_host_files`: read no file but the document.** Off,
+  the PDF reader reads nothing from the machine it runs on, for an
+  application reading files it did not write. A font the document does not
+  carry is drawn with stet's own fonts instead of one installed on the
+  machine, the machine's fonts are never listed and
+  `~/.cache/stet/system_fonts.json` is not written. A composite font
+  keeps its codes and widths and its text is read, though only the
+  characters stet's Latin fonts have are drawn. No CMap file is read from
+  `STET_CMAP_DIR`, `~/.local/share/stet/CMap` or the poppler and
+  Ghostscript folders, so a predefined CMap the document does not carry is
+  reported as not found. CMYK is drawn with stet's own profile, which
+  `stet-pdf-reader` now embeds, in place of the system's from the
+  ColorSync folders, `/usr/share/color/icc` or the Windows spool color
+  folder. On by default, and nothing changes then. See
+  `docs/PDF-READER-API.md`, "Reading no file from the machine".
+
+- **A page whose content asks for too much is stopped, with an error of
+  its own kind.** Nothing bounded how many graphics states a page could
+  save: a 51 KB file whose Flate content stream decodes to 50 MB of `q`
+  took 17.7 s and 16.9 GB to read. A page now holds at most 1,024 saved
+  states at once (`MAX_SAVED_STATES`), counting the state each form,
+  pattern, glyph procedure and soft mask saves around its content; ISO
+  32000-1 gives 28 as a typical limit. New too is
+  `PdfDocument::set_max_content_bytes`, a ceiling on the decoded bytes
+  of content one page interprets, counting a form each time it is
+  drawn, and decoding no stream but a glyph procedure further than what
+  is left of it. Off by default, since a heavy page of vector art reaches
+  a hundred megabytes.
+  A page over either limit is not drawn: `render_page` returns the new
+  `PdfError::ContentLimit`, carrying a `ContentLimit` that names the
+  limit, and adds no parse warning for it, so a caller tells it apart
+  from a damaged page by kind. The other pages read as before. See
+  `docs/PDF-READER-API.md`, "A ceiling on page content".
+
 - **What the PDF reader repaired or left out is reported by its kind.**
   Four new `ParsePhase` variants let an application tell these apart in
   `parse_warnings` without reading messages. `ImageLeftOut { width,
@@ -25,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   See `docs/PDF-READER-API.md`, "Images, fonts and CMaps left out".
 
 ### Changed
+
+- **A document opened with `from_bytes` or `from_owned` looks for the
+  system's CMYK profile when it first needs its colors, not as it is
+  opened.** The profile is the same and is still found once per process;
+  opening costs that much less and the first page that much more.
 
 - **Text in a font whose CMap is not found is left out.** Its codes were
   read two bytes at a time, which for a CMap such as `GBK-EUC-H` drew the

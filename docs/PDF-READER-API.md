@@ -97,10 +97,11 @@ which a `Vec<u8>`, a `Box<[u8]>` and an `Arc<[u8]>` all are.
 
 The constructors that take no colour cache — `from_bytes` and
 `from_owned` — start from the system's CMYK profile when there is one.
-It is found and prepared once per process (about 30 ms) and each document
-takes its own copy, so opening a second document costs only its own
-parsing. A profile installed while the process runs is not picked up;
-build an `IccCache` and use a `_with_icc` constructor for that.
+It is found and prepared once per process (about 30 ms), when a document
+first needs its colors, and each document takes its own copy, so a
+second document costs only its own parsing. A profile installed while
+the process runs is not picked up; build an `IccCache` and use a
+`_with_icc` constructor for that.
 
 A document keeps the fonts its pages use. A font is resolved — its
 program read, its encoding, widths and character maps built — the first
@@ -112,6 +113,38 @@ going first, so a long document whose every page embeds fonts of its own
 does not hold them all; `set_font_provider` discards them, since what a
 font resolves to depends on the provider. A font that failed to resolve is
 not kept, and each page that uses it says so.
+
+### Reading no file from the machine
+
+By default the reader reads what a document needs from the machine it
+runs on: a font the document names and does not carry is looked for
+among the installed fonts (listed the first time, in
+`~/.cache/stet/system_fonts.json`), a predefined CMap in `STET_CMAP_DIR`,
+`~/.local/share/stet/CMap` and the poppler and Ghostscript folders, and
+the CMYK profile of a document opened without a color cache in the
+ColorSync folders, `/usr/share/color/icc` or the Windows spool color
+folder. An application reading files it did not write can turn all of
+that off:
+
+```rust
+# let mut doc: stet_pdf_reader::PdfDocument = unimplemented!();
+doc.set_host_files(false);
+```
+
+The reader then reads no file but the document. A font not carried is
+drawn with stet's own fonts, the URW base 35, and its text is read as the
+document encodes it; for a composite font only the characters those Latin
+fonts have glyphs for are drawn, so Chinese, Japanese or Korean text is
+read but not drawn. A predefined CMap not carried is reported as not
+found, the same `ParsePhase::MissingCMap` warning as when no folder has it,
+and no name from the document becomes a path. CMYK is drawn with stet's
+own profile (CGATS001Compat-v2-micro, public domain), both for a document
+opened without a color cache and for one given a cache with no CMYK
+profile; a cache given with one is used as it is.
+
+Set it before the first page is read. The system's profile is looked for
+only when a document first needs its colors, so a document switched off
+before then never reads it. Fonts already resolved are resolved again.
 
 ### Display lists and resolution
 
@@ -191,6 +224,59 @@ What is counted is the size decoded:
 - For every other image, mask and soft mask, the `/Width` times `/Height`
   in its dictionary. A soft mask over the ceiling takes its image with
   it: the image without its mask would be the wrong picture.
+
+### A ceiling on page content
+
+A page's content can ask for far more than its size in the file
+suggests: a few kilobytes of Flate decode to hundreds of megabytes of
+operators. Two limits bound what one page may ask for.
+
+The graphics states saved at once, by `q` and by each form, pattern,
+glyph procedure and soft mask around its own content, are held to
+`MAX_SAVED_STATES`, 1,024. That is always on: ISO 32000-1 Annex C gives
+28 as a typical limit for a reader, and before it, 50 MB of `q` from a
+51 KB file took 17 seconds and 17 GB to read.
+
+The bytes of content a page interprets have no limit of their own by
+default, because a heavy page of vector art legitimately reaches a
+hundred megabytes. An application that reads files it did not write can
+set one:
+
+```rust
+# let mut doc: stet_pdf_reader::PdfDocument = unimplemented!();
+doc.set_max_content_bytes(Some(64 << 20)); // decoded bytes per page
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+What is counted is the decoded bytes of the page's content streams,
+joined, and of every form, pattern cell, soft-mask group, Type 3 glyph
+procedure and annotation appearance the page runs, each time it runs: a
+form drawn ten times counts ten times. Every one of them but a glyph
+procedure is decoded no further than what is left of the limit. A Type 3
+font's glyph procedures are decoded in full when the font is loaded,
+held only to the limit every stream is, and count toward this one each
+time they run. `None`, the default, lifts it.
+
+A page over either limit is not drawn, rather than drawn in part.
+`render_page` returns `PdfError::ContentLimit`, whose `ContentLimit`
+says which limit it was and what it was set to:
+
+```rust
+# use stet_pdf_reader::{ContentLimit, PdfError};
+# let doc: stet_pdf_reader::PdfDocument = unimplemented!();
+match doc.render_page(0, 150.0) {
+    Ok(list) => { /* the whole page */ }
+    Err(PdfError::ContentLimit(ContentLimit::SavedStates(n))) => { /* q nested past n */ }
+    Err(PdfError::ContentLimit(limit)) => { /* over another limit */ }
+    Err(e) => { /* the page could not be read */ }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+That error is the report: nothing is added to `parse_warnings` for what
+was not drawn, so a page stopped by a limit is told apart from a damaged
+one by the error's kind. The document is unaffected, and its other pages
+are read as before.
 
 ### Giving up on a page
 

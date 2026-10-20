@@ -81,6 +81,9 @@ pub struct Resolver<'a> {
     /// Most samples an image may have and still be decoded: the
     /// application's ceiling, or the built-in one.
     max_image_pixels: std::cell::Cell<u64>,
+    /// Whether fonts and CMaps may be read from the machine's files: see
+    /// `PdfDocument::set_host_files`.
+    host_files: std::cell::Cell<bool>,
     /// The fonts resolved so far, kept from one page to the next.
     pub(crate) fonts: RefCell<crate::content::font::DocumentFonts>,
     /// The ICC profile streams read so far, by object: the decoded bytes and
@@ -347,6 +350,16 @@ impl<'a> Resolver<'a> {
             .set(pixels.min(stet_graphics::image_limits::MAX_IMAGE_PIXELS));
     }
 
+    /// Whether fonts and CMaps may be read from the machine's files.
+    pub(crate) fn host_files(&self) -> bool {
+        self.host_files.get()
+    }
+
+    /// Set [`host_files`](Self::host_files).
+    pub(crate) fn set_host_files(&self, enabled: bool) {
+        self.host_files.set(enabled);
+    }
+
     /// Decode a stream's filters, recording what the decoders recovered
     /// from as content warnings.
     pub(crate) fn decode_filters(
@@ -400,6 +413,7 @@ impl<'a> Resolver<'a> {
             icc_profiles: RefCell::new(HashMap::new()),
             content_capture: RefCell::default(),
             max_image_pixels: std::cell::Cell::new(stet_graphics::image_limits::MAX_IMAGE_PIXELS),
+            host_files: std::cell::Cell::new(true),
         }
     }
 
@@ -438,6 +452,7 @@ impl<'a> Resolver<'a> {
             icc_profiles: RefCell::new(HashMap::new()),
             content_capture: RefCell::default(),
             max_image_pixels: std::cell::Cell::new(stet_graphics::image_limits::MAX_IMAGE_PIXELS),
+            host_files: std::cell::Cell::new(true),
         }
     }
 
@@ -556,8 +571,30 @@ impl<'a> Resolver<'a> {
 
     /// Resolve an object and return its decompressed stream data.
     pub fn stream_data(&self, obj_num: u32, gen_num: u16) -> Result<Vec<u8>, PdfError> {
+        self.stream_data_within(obj_num, gen_num, None)
+    }
+
+    /// [`stream_data`](Self::stream_data), for content a page interprets:
+    /// with `allowance` set, a stream that decodes to more than that many
+    /// bytes is [`ContentLimit::ContentBytes`](crate::error::ContentLimit::ContentBytes),
+    /// and decoding stops there rather than at the end of the stream.
+    pub(crate) fn stream_data_within(
+        &self,
+        obj_num: u32,
+        gen_num: u16,
+        allowance: Option<usize>,
+    ) -> Result<Vec<u8>, PdfError> {
+        let over = |len: usize| allowance.is_some_and(|max| len > max);
+        let over_error = || {
+            PdfError::ContentLimit(crate::error::ContentLimit::ContentBytes(
+                allowance.unwrap_or_default() as u64,
+            ))
+        };
         // Check stream cache first
         if let Some(cached) = self.stream_cache.borrow().get(&obj_num) {
+            if over(cached.len()) {
+                return Err(over_error());
+            }
             return Ok(cached.clone());
         }
 
@@ -577,15 +614,24 @@ impl<'a> Resolver<'a> {
                 };
                 let (filter_list, parms) = filters::parse_filters(&dict, Some(self))?;
                 let result = if filter_list.is_empty() {
+                    if over(raw.len()) {
+                        return Err(over_error());
+                    }
                     Ok(raw)
                 } else {
                     let jbig2_globals = self.resolve_jbig2_globals(&filter_list, &parms)?;
+                    let budget = match (filters::DecodeBudget::for_stream(&dict), allowance) {
+                        (budget, Some(max)) if max < budget.limit() => {
+                            filters::DecodeBudget::for_content(max)
+                        }
+                        (budget, _) => budget,
+                    };
                     self.decode_filters(
                         &raw,
                         &filter_list,
                         &parms,
                         jbig2_globals.as_deref(),
-                        filters::DecodeBudget::for_stream(&dict),
+                        budget,
                     )
                 }?;
 
@@ -669,6 +715,28 @@ impl<'a> Resolver<'a> {
             }
             _ => Err(PdfError::Other("expected a stream object".into())),
         }
+    }
+
+    /// [`stream_data_from_obj`](Self::stream_data_from_obj), decoding no
+    /// more than `allowance` bytes: see
+    /// [`stream_data_within`](Self::stream_data_within).
+    pub(crate) fn stream_data_from_obj_within(
+        &self,
+        obj: &PdfObj,
+        allowance: usize,
+    ) -> Result<Vec<u8>, PdfError> {
+        if let PdfObj::Ref(n, g) = obj {
+            return self.stream_data_within(*n, *g, Some(allowance));
+        }
+        // A stream held directly, not by reference, is not something a page
+        // draws; it is read as it always was, and then measured.
+        let data = self.stream_data_from_obj(obj)?;
+        if data.len() > allowance {
+            return Err(PdfError::ContentLimit(
+                crate::error::ContentLimit::ContentBytes(allowance as u64),
+            ));
+        }
+        Ok(data)
     }
 
     /// Return the raw (undecoded, possibly encrypted) stream bytes for an
